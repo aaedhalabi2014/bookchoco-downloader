@@ -8,31 +8,8 @@ from urllib.parse import urlsplit
 from .config import settings
 
 
-BASE_ALLOWED_HOSTS = {
-    "instagram.com",
-    "www.instagram.com",
-    "facebook.com",
-    "www.facebook.com",
-    "m.facebook.com",
-    "fb.watch",
-    "x.com",
-    "www.x.com",
-    "twitter.com",
-    "www.twitter.com",
-    "tiktok.com",
-    "www.tiktok.com",
-    "vm.tiktok.com",
-    "vt.tiktok.com",
-    "threads.net",
-    "www.threads.net",
-    "reddit.com",
-    "www.reddit.com",
-    "redd.it",
-    "v.redd.it",
-    "vimeo.com",
-    "www.vimeo.com",
-}
-
+# Only explicitly trusted media-platform domains are accepted. Subdomains of
+# these roots are also accepted safely (e.g. music.youtube.com, clips.twitch.tv).
 PLATFORM_BY_SUFFIX = {
     "instagram.com": "Instagram",
     "facebook.com": "Facebook",
@@ -45,6 +22,27 @@ PLATFORM_BY_SUFFIX = {
     "redd.it": "Reddit",
     "v.redd.it": "Reddit",
     "vimeo.com": "Vimeo",
+
+    # Expanded support
+    "youtube.com": "YouTube",
+    "youtu.be": "YouTube",
+    "youtube-nocookie.com": "YouTube",
+    "pinterest.com": "Pinterest",
+    "pin.it": "Pinterest",
+    "snapchat.com": "Snapchat",
+    "twitch.tv": "Twitch",
+    "dailymotion.com": "Dailymotion",
+    "dai.ly": "Dailymotion",
+    "soundcloud.com": "SoundCloud",
+    "streamable.com": "Streamable",
+    "rumble.com": "Rumble",
+    "bilibili.com": "Bilibili",
+    "b23.tv": "Bilibili",
+    "kick.com": "Kick",
+    "bsky.app": "Bluesky",
+    "flickr.com": "Flickr",
+    "9gag.com": "9GAG",
+    "odysee.com": "Odysee",
 }
 
 
@@ -73,11 +71,12 @@ def _is_private_or_special(ip_text: str) -> bool:
     )
 
 
-def _platform_for(hostname: str) -> str:
-    for suffix, platform in PLATFORM_BY_SUFFIX.items():
+def _platform_for(hostname: str) -> str | None:
+    # Longest suffix first so exact/specific domains win predictably.
+    for suffix in sorted(PLATFORM_BY_SUFFIX, key=len, reverse=True):
         if hostname == suffix or hostname.endswith("." + suffix):
-            return platform
-    return "Video"
+            return PLATFORM_BY_SUFFIX[suffix]
+    return None
 
 
 def validate_public_media_url(raw_url: str) -> ValidatedURL:
@@ -98,9 +97,15 @@ def validate_public_media_url(raw_url: str) -> ValidatedURL:
         raise URLValidationError("الروابط التي تحتوي بيانات دخول غير مسموحة.")
 
     hostname = parts.hostname.lower().rstrip(".")
-    allowed = BASE_ALLOWED_HOSTS | settings.extra_hosts
-    if hostname not in allowed:
+    platform = _platform_for(hostname)
+
+    # EXTRA_ALLOWED_HOSTS stays exact-match only by design. This prevents an
+    # environment typo from turning into a wildcard allow rule.
+    if platform is None and hostname not in settings.extra_hosts:
         raise URLValidationError("هذه المنصة غير مفعّلة حاليًا في النسخة الحالية.")
+
+    if platform is None:
+        platform = "Video"
 
     try:
         addresses = socket.getaddrinfo(hostname, parts.port or 443, type=socket.SOCK_STREAM)
@@ -111,4 +116,4 @@ def validate_public_media_url(raw_url: str) -> ValidatedURL:
     if not resolved or any(_is_private_or_special(ip) for ip in resolved):
         raise URLValidationError("تم رفض الرابط لأسباب أمنية.")
 
-    return ValidatedURL(url=candidate, hostname=hostname, platform=_platform_for(hostname))
+    return ValidatedURL(url=candidate, hostname=hostname, platform=platform)
