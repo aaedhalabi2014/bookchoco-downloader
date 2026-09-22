@@ -11,12 +11,13 @@ DB_PATH = RUNTIME_DIR / "jobs.sqlite3"
 class Settings(BaseSettings):
     app_name: str = "Bookchoco Download"
     app_env: str = "production"
-    public_base_url: str = "https://download.bookchoco.online"
-    max_video_mb: int = 750
-    job_ttl_minutes: int = 60
-    rate_limit_requests: int = 12
+    public_base_url: str = "https://api-download.bookchoco.online"
+    frontend_origin: str = "https://download.bookchoco.online"
+    max_video_mb: int = 350
+    job_ttl_minutes: int = 45
+    rate_limit_requests: int = 8
     rate_limit_window_seconds: int = 60
-    max_concurrent_downloads: int = 3
+    max_concurrent_downloads: int = 1
     download_max_height: int = 1080
     extra_allowed_hosts: str = ""
 
