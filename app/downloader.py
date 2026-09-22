@@ -52,21 +52,95 @@ def download_video(job_id: str, url: str, platform: str) -> None:
     job_dir = DOWNLOAD_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     last_progress = -1
+    stream_state: dict[str, dict[str, int]] = {}
+    expected_total_bytes = 0
+
+    def _size_of(fmt: dict[str, Any]) -> int:
+        return int(fmt.get("filesize") or fmt.get("filesize_approx") or 0)
+
+    def _discover_expected_total(info: dict[str, Any]) -> int:
+        requested = info.get("requested_formats") or info.get("requested_downloads") or []
+        if isinstance(requested, list):
+            total = sum(_size_of(fmt) for fmt in requested if isinstance(fmt, dict))
+            if total > 0:
+                return total
+        return _size_of(info)
 
     def hook(data: dict[str, Any]) -> None:
-        nonlocal last_progress
+        nonlocal last_progress, expected_total_bytes
         status = data.get("status")
+        info = data.get("info_dict") if isinstance(data.get("info_dict"), dict) else {}
+
         if status == "downloading":
             downloaded = int(data.get("downloaded_bytes") or 0)
             total = int(data.get("total_bytes") or data.get("total_bytes_estimate") or 0)
-            if downloaded > settings.max_video_bytes:
+
+            discovered = _discover_expected_total(info)
+            if discovered > expected_total_bytes:
+                expected_total_bytes = discovered
+
+            format_id = str(info.get("format_id") or "")
+            filename = str(data.get("filename") or data.get("tmpfilename") or "")
+            stream_key = f"{filename}::{format_id}" or "current"
+            stream_state[stream_key] = {"downloaded": downloaded, "total": total}
+
+            aggregate_downloaded = sum(item["downloaded"] for item in stream_state.values())
+            known_total = sum(item["total"] for item in stream_state.values() if item["total"] > 0)
+            aggregate_total = max(expected_total_bytes, known_total, total)
+
+            if aggregate_downloaded > settings.max_video_bytes:
                 raise DownloadTooLarge
-            progress = min(94, int(downloaded * 94 / total)) if total else 10
-            if progress >= last_progress + 2:
+
+            progress = (
+                min(100, int(aggregate_downloaded * 100 / aggregate_total))
+                if aggregate_total > 0
+                else max(1, last_progress)
+            )
+            speed = float(data.get("speed") or 0) or None
+            eta = None
+            if speed and aggregate_total > aggregate_downloaded:
+                eta = int((aggregate_total - aggregate_downloaded) / speed)
+            elif data.get("eta") is not None:
+                eta = int(data.get("eta") or 0)
+
+            # Keep the ring monotonic even when YouTube downloads video and
+            # audio as separate streams. The byte counters remain raw telemetry.
+            progress = max(last_progress, progress)
+            if progress != last_progress or downloaded == total:
                 last_progress = progress
-                update_job(job_id, status="downloading", progress=progress)
+                update_job(
+                    job_id,
+                    status="downloading",
+                    phase="downloading",
+                    progress=progress,
+                    downloaded_bytes=aggregate_downloaded,
+                    total_bytes=aggregate_total,
+                    speed_bps=speed,
+                    eta_seconds=eta,
+                )
+
         elif status == "finished":
-            update_job(job_id, status="processing", progress=95)
+            downloaded = int(data.get("downloaded_bytes") or 0)
+            total = int(data.get("total_bytes") or data.get("total_bytes_estimate") or downloaded)
+            format_id = str(info.get("format_id") or "")
+            filename = str(data.get("filename") or data.get("tmpfilename") or "")
+            stream_key = f"{filename}::{format_id}" or "current"
+            stream_state[stream_key] = {
+                "downloaded": max(downloaded, total),
+                "total": max(total, downloaded),
+            }
+
+    def postprocessor_hook(data: dict[str, Any]) -> None:
+        status = data.get("status")
+        if status == "started":
+            update_job(
+                job_id,
+                status="processing",
+                phase="processing",
+                progress=100,
+                speed_bps=None,
+                eta_seconds=None,
+            )
 
     max_height = settings.download_max_height
 
@@ -78,6 +152,7 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             "no_warnings": True,
             "restrictfilenames": False,
             "progress_hooks": [hook],
+            "postprocessor_hooks": [postprocessor_hook],
             "retries": 2,
             "fragment_retries": 2,
             "socket_timeout": 25,
@@ -162,7 +237,16 @@ def download_video(job_id: str, url: str, platform: str) -> None:
                 _reset_job_dir(job_dir)
                 last_progress = -1
 
-            update_job(job_id, status="preparing", progress=3)
+            update_job(
+                job_id,
+                status="preparing",
+                phase="preparing",
+                progress=0,
+                downloaded_bytes=0,
+                total_bytes=0,
+                speed_bps=None,
+                eta_seconds=None,
+            )
 
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -197,6 +281,17 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             job_id,
             status="ready",
             progress=100,
+            phase="ready",
+            downloaded_bytes=max(
+                sum(item["downloaded"] for item in stream_state.values()),
+                sum(item["total"] for item in stream_state.values()),
+            ),
+            total_bytes=max(
+                expected_total_bytes,
+                sum(item["total"] for item in stream_state.values()),
+            ),
+            speed_bps=None,
+            eta_seconds=0,
             platform=platform,
             title=title,
             filename=final_name,
