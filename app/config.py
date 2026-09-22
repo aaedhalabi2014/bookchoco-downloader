@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     max_concurrent_downloads: int = 1
     download_max_height: int = 1080
     extra_allowed_hosts: str = ""
+    youtube_proxy_url: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
