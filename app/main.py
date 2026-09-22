@@ -158,7 +158,7 @@ def job_status(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/download")
-def download(job_id: str):
+def download(job_id: str, preview: bool = False):
     job = get_job(job_id)
     if not job or job.status not in {"ready", "served"} or not job.file_path:
         raise HTTPException(status_code=404, detail="الملف غير جاهز أو انتهت صلاحيته.")
@@ -170,11 +170,24 @@ def download(job_id: str):
 
     update_job(job_id, status="served")
 
+    suffix = path.suffix.lower()
+    media_type = {
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".m4v": "video/x-m4v",
+        ".webm": "video/webm",
+    }.get(suffix, "application/octet-stream")
+
+    headers = {"Cache-Control": "no-store"}
+    if not preview:
+        headers["X-Download-Options"] = "noopen"
+
     return FileResponse(
         path,
         filename=job.filename or "video.mp4",
-        media_type="application/octet-stream",
-        headers={"Cache-Control": "no-store", "X-Download-Options": "noopen"},
+        media_type=media_type,
+        content_disposition_type="inline" if preview else "attachment",
+        headers=headers,
     )
 
 
