@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: bookchoco-downloader
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: PUBLIC_BASE_URL
+        value: https://api-download.bookchoco.online
+      - key: FRONTEND_ORIGIN
+        value: https://download.bookchoco.online
+      - key: MAX_VIDEO_MB
+        value: "350"
+      - key: JOB_TTL_MINUTES
+        value: "45"
+      - key: RATE_LIMIT_REQUESTS
+        value: "8"
+      - key: RATE_LIMIT_WINDOW_SECONDS
+        value: "60"
+      - key: MAX_CONCURRENT_DOWNLOADS
+        value: "1"
+      - key: DOWNLOAD_MAX_HEIGHT
+        value: "1080"
