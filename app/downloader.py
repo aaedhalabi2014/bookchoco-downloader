@@ -15,6 +15,7 @@ from .jobs import update_job
 
 _DOWNLOAD_SEMAPHORE = threading.BoundedSemaphore(settings.max_concurrent_downloads)
 _SAFE_FILENAME_RE = re.compile(r"[^\w\-. ()\[\]\u0600-\u06FF]+", re.UNICODE)
+_POT_PROVIDER_URL = "http://127.0.0.1:4416"
 
 
 class DownloadTooLarge(Exception):
@@ -93,33 +94,43 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             ],
         }
 
-    # YouTube currently applies different bot/PO-token requirements to different
-    # player clients. Try the normal extractor first, then a conservative set of
-    # public clients that yt-dlp documents as useful fallbacks.
     attempts: list[dict[str, Any]] = [base_opts()]
-    if platform == "YouTube":
-        fallback = base_opts()
-        fallback["extractor_args"] = {
-            "youtube": {
-                "player_client": ["android_vr", "web_embedded", "tv_simply", "web_safari"],
-            }
-        }
-        attempts.append(fallback)
 
-        # Last free fallback: prefer HLS when web_safari exposes it. This can
-        # work when direct GVS formats are gated behind a PO token.
-        hls_fallback = base_opts()
-        hls_fallback["extractor_args"] = {
+    if platform == "YouTube":
+        # Current yt-dlp guidance recommends mweb + a PO-token provider.
+        # bgutil is running locally on 127.0.0.1:4416 in the same container.
+        pot = base_opts()
+        pot["extractor_args"] = {
+            "youtube": {
+                "player_client": ["mweb"],
+            },
+            "youtubepot-bgutilhttp": {
+                "base_url": [_POT_PROVIDER_URL],
+            },
+        }
+
+        # If the provider/client combination is temporarily affected by a
+        # YouTube experiment, fall back to yt-dlp's default clients next.
+        default_clients = base_opts()
+
+        # Final fallback tries clients that sometimes expose different playback
+        # paths, including HLS on Safari.
+        hls = base_opts()
+        hls["extractor_args"] = {
             "youtube": {
                 "player_client": ["web_safari", "android_vr", "web_embedded"],
-            }
+            },
+            "youtubepot-bgutilhttp": {
+                "base_url": [_POT_PROVIDER_URL],
+            },
         }
-        hls_fallback["format"] = (
+        hls["format"] = (
             f"b[protocol^=m3u8][height<={max_height}]/"
             f"bv*[protocol^=m3u8][height<={max_height}]+ba[protocol^=m3u8]/"
             f"b[height<={max_height}]/b"
         )
-        attempts.append(hls_fallback)
+
+        attempts = [pot, default_clients, hls]
 
     acquired = _DOWNLOAD_SEMAPHORE.acquire(timeout=120)
     if not acquired:
@@ -134,9 +145,8 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             if index:
                 _reset_job_dir(job_dir)
                 last_progress = -1
-                update_job(job_id, status="preparing", progress=3)
-            else:
-                update_job(job_id, status="preparing", progress=3)
+
+            update_job(job_id, status="preparing", progress=3)
 
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -149,7 +159,6 @@ def download_video(job_id: str, url: str, platform: str) -> None:
                 last_error = exc
                 if platform != "YouTube" or index == len(attempts) - 1:
                     raise
-                continue
 
         if last_error is not None:
             raise last_error
@@ -162,6 +171,7 @@ def download_video(job_id: str, url: str, platform: str) -> None:
         extension = output.suffix.lower() or ".mp4"
         final_name = f"{title}{extension}"
         final_path = job_dir / final_name
+
         if final_path != output:
             if final_path.exists():
                 final_path.unlink()
@@ -186,11 +196,11 @@ def download_video(job_id: str, url: str, platform: str) -> None:
 
         if platform == "YouTube" and any(
             token in message
-            for token in ("confirm you're not a bot", "sign in", "login_required", "po token", "http error 403")
+            for token in ("confirm you're not a bot", "login_required", "po token", "http error 403")
         ):
             user_error = (
-                "الفيديو عام، لكن YouTube رفض اتصال خادم التحميل مؤقتًا بسبب حماية البوتات. "
-                "جرّب مرة ثانية بعد قليل."
+                "YouTube ما زال يرفض عنوان خادم Render لهذا الرابط رغم محاولة التحقق الآلية. "
+                "هذا ليس لأن الفيديو خاص."
             )
         elif any(token in message for token in ("private", "members-only", "age-restricted", "cookies")):
             user_error = "الفيديو يحتاج صلاحية أو تسجيل دخول ولا يمكن تنزيله كرابط عام."
