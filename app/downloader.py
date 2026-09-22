@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,106 @@ def _select_output(job_dir: Path) -> Path:
 def _reset_job_dir(job_dir: Path) -> None:
     shutil.rmtree(job_dir, ignore_errors=True)
     job_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _probe_codecs(path: Path) -> tuple[str | None, str | None, str | None]:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "stream=codec_type,codec_name,pix_fmt",
+                "-of", "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        payload = json.loads(result.stdout or "{}")
+        video_codec = None
+        audio_codec = None
+        pixel_format = None
+        for stream in payload.get("streams", []):
+            if stream.get("codec_type") == "video" and video_codec is None:
+                video_codec = stream.get("codec_name")
+                pixel_format = stream.get("pix_fmt")
+            elif stream.get("codec_type") == "audio" and audio_codec is None:
+                audio_codec = stream.get("codec_name")
+        return video_codec, audio_codec, pixel_format
+    except Exception:
+        return None, None, None
+
+
+def _make_ios_compatible(path: Path, job_id: str) -> Path:
+    video_codec, audio_codec, pixel_format = _probe_codecs(path)
+    temp = path.with_name(f"{path.stem}.ios.mp4")
+
+    # H.264 + AAC is the safest common target for Safari, iOS Photos and the
+    # native share sheet. If the codecs are already right, only remux so the
+    # MP4 metadata (moov atom) is moved to the front for immediate playback.
+    already_safe = (
+        path.suffix.lower() == ".mp4"
+        and video_codec == "h264"
+        and audio_codec in {None, "aac"}
+        and (pixel_format is None or pixel_format in {"yuv420p", "yuvj420p"})
+    )
+
+    update_job(
+        job_id,
+        status="processing",
+        phase="processing",
+        progress=100,
+        speed_bps=None,
+        eta_seconds=None,
+    )
+
+    if already_safe:
+        command = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", str(path),
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(temp),
+        ]
+    else:
+        command = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", str(path),
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "22",
+            "-pix_fmt", "yuv420p",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:a", "aac",
+            "-b:a", "160k",
+            "-movflags", "+faststart",
+            str(temp),
+        ]
+
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        if temp.exists() and temp.stat().st_size > 0:
+            if path.exists():
+                path.unlink()
+            return temp
+    except Exception:
+        temp.unlink(missing_ok=True)
+
+    # Do not destroy an otherwise downloadable file if FFmpeg normalization
+    # fails for an unusual source.
+    return path
 
 
 def download_video(job_id: str, url: str, platform: str) -> None:
@@ -269,6 +371,10 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             raise last_error
 
         output = _select_output(job_dir)
+        if output.stat().st_size > settings.max_video_bytes:
+            raise DownloadTooLarge
+
+        output = _make_ios_compatible(output, job_id)
         if output.stat().st_size > settings.max_video_bytes:
             raise DownloadTooLarge
 
