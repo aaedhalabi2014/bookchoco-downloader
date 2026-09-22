@@ -5,12 +5,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Modern YouTube extraction needs a JavaScript runtime for challenge solving.
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- --yes --no-modify-path \
+    && deno --version
 
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --upgrade pip && pip install -r requirements.txt
+# yt-dlp recommends the nightly/pre-release channel when stable breaks on sites.
+RUN pip install --upgrade pip && pip install --pre -U -r requirements.txt
 COPY app ./app
 
 RUN useradd --create-home --uid 10001 appuser \
