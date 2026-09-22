@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f6f3ee">
+<meta name="description" content="حمّل فيديوهاتك العامة من المنصات المدعومة بسهولة.">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<title>Bookchoco Download</title>
+</head>
+<body>
+<div class="shell">
+<header><div class="brand"><i></i> BOOKCHOCO</div><button id="installBtn" hidden>إضافة للشاشة</button></header>
+<main>
+<section class="hero">
+<button id="pasteButton" class="orb" aria-label="لصق الرابط"><span>☝</span></button>
+<div id="idleCopy"><h1>انسخ الرابط.<br><b>واضغط هنا.</b></h1><p>سنكتشف المنصة ونجهّز الفيديو تلقائيًا.</p></div>
+<form id="manualForm" hidden><label for="urlInput">الصق رابط الفيديو</label><div><input id="urlInput" type="url" placeholder="https://..."><button>تحميل</button></div></form>
+<section id="progressPanel" class="card" hidden><div class="row"><strong id="platformBadge">VIDEO</strong><span id="statusText">جاري التجهيز…</span></div><div class="track"><div id="progressBar"></div></div><small id="progressValue">0%</small></section>
+<section id="readyPanel" class="card" hidden><div class="ok">✓</div><strong id="readyTitle">الفيديو جاهز</strong><span id="readyPlatform"></span><a id="downloadButton" href="#" download>تحميل الفيديو ↓</a><button id="againButton">رابط آخر</button></section>
+<section id="errorPanel" class="card error" hidden><strong>!</strong><p id="errorText">تعذر تجهيز الفيديو.</p><button id="retryButton">جرّب رابطًا آخر</button></section>
+</section>
+<div class="platforms">Instagram · Facebook · X · TikTok · Threads · Reddit · Vimeo</div>
+</main>
+<footer>للروابط العامة فقط. الملفات مؤقتة وتُحذف تلقائيًا.</footer>
+</div>
+<script src="/app.js" defer></script>
+</body></html>
