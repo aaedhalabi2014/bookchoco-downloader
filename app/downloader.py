@@ -101,12 +101,8 @@ def download_video(job_id: str, url: str, platform: str) -> None:
         # bgutil is running locally on 127.0.0.1:4416 in the same container.
         pot = base_opts()
         pot["extractor_args"] = {
-            "youtube": {
-                "player_client": ["mweb"],
-            },
-            "youtubepot-bgutilhttp": {
-                "base_url": [_POT_PROVIDER_URL],
-            },
+            "youtube": ["player_client=mweb"],
+            "youtubepot-bgutilhttp": [f"base_url={_POT_PROVIDER_URL}"],
         }
 
         # If the provider/client combination is temporarily affected by a
@@ -117,12 +113,8 @@ def download_video(job_id: str, url: str, platform: str) -> None:
         # paths, including HLS on Safari.
         hls = base_opts()
         hls["extractor_args"] = {
-            "youtube": {
-                "player_client": ["web_safari", "android_vr", "web_embedded"],
-            },
-            "youtubepot-bgutilhttp": {
-                "base_url": [_POT_PROVIDER_URL],
-            },
+            "youtube": ["player_client=web_safari,android_vr,web_embedded"],
+            "youtubepot-bgutilhttp": [f"base_url={_POT_PROVIDER_URL}"],
         }
         hls["format"] = (
             f"b[protocol^=m3u8][height<={max_height}]/"
@@ -130,7 +122,26 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             f"b[height<={max_height}]/b"
         )
 
-        attempts = [pot, default_clients, hls]
+        pot_legacy = base_opts()
+        pot_legacy["extractor_args"] = {
+            "youtube": ["player_client=mweb"],
+            "youtubepot-bgutilhttp": [
+                f"base_url={_POT_PROVIDER_URL};disable_innertube=1"
+            ],
+        }
+
+        web_pot = base_opts()
+        web_pot["extractor_args"] = {
+            "youtube": ["player_client=web"],
+            "youtubepot-bgutilhttp": [f"base_url={_POT_PROVIDER_URL}"],
+        }
+
+        # Force IPv4 for yt-dlp's media requests on cloud hosts. This does not
+        # change the provider's loopback connection.
+        for attempt in (pot, pot_legacy, web_pot, default_clients, hls):
+            attempt["source_address"] = "0.0.0.0"
+
+        attempts = [pot, pot_legacy, web_pot, default_clients, hls]
 
     acquired = _DOWNLOAD_SEMAPHORE.acquire(timeout=120)
     if not acquired:
@@ -202,8 +213,17 @@ def download_video(job_id: str, url: str, platform: str) -> None:
                 "YouTube ما زال يرفض عنوان خادم Render لهذا الرابط رغم محاولة التحقق الآلية. "
                 "هذا ليس لأن الفيديو خاص."
             )
-        elif any(token in message for token in ("private", "members-only", "age-restricted", "cookies")):
-            user_error = "الفيديو يحتاج صلاحية أو تسجيل دخول ولا يمكن تنزيله كرابط عام."
+        elif any(
+            token in message
+            for token in (
+                "private video",
+                "this video is private",
+                "members-only",
+                "members only",
+                "age-restricted",
+            )
+        ):
+            user_error = "الفيديو يحتاج صلاحية فعلية أو تسجيل دخول ولا يمكن تنزيله كرابط عام."
         elif "unsupported url" in message:
             user_error = "هذا الرابط غير مدعوم حاليًا."
         else:
