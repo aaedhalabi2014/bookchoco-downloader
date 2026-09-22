@@ -4,14 +4,30 @@ set -eu
 # Start the PO-token provider locally. v2.0.0 binds to localhost; keeping it
 # local also avoids exposing its unauthenticated endpoint to the internet.
 cd /opt/bgutil-ytdlp-pot-provider/server/node_modules
-deno run \
-  --allow-env \
-  --allow-net \
-  --allow-ffi=. \
-  --allow-read=. \
-  ../src/main.ts \
-  --host 127.0.0.1 \
-  --port 4416 &
+
+if [ -n "${YOUTUBE_PROXY_URL:-}" ]; then
+  # The token provider must see the same egress IP as yt-dlp.
+  HTTPS_PROXY="$YOUTUBE_PROXY_URL" \
+  HTTP_PROXY="$YOUTUBE_PROXY_URL" \
+  ALL_PROXY="$YOUTUBE_PROXY_URL" \
+  deno run \
+    --allow-env \
+    --allow-net \
+    --allow-ffi=. \
+    --allow-read=. \
+    ../src/main.ts \
+    --host 127.0.0.1 \
+    --port 4416 &
+else
+  deno run \
+    --allow-env \
+    --allow-net \
+    --allow-ffi=. \
+    --allow-read=. \
+    ../src/main.ts \
+    --host 127.0.0.1 \
+    --port 4416 &
+fi
 
 # Wait briefly for the local provider before accepting download requests.
 python - <<'PY'
