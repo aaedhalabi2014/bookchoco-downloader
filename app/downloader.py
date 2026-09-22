@@ -125,14 +125,18 @@ def _make_ios_compatible(path: Path, job_id: str) -> Path:
     video_codec, audio_codec, pixel_format = _probe_codecs(path)
     safe_codecs = (
         path.suffix.lower() == ".mp4"
-        and video_codec == "h264"
+        and video_codec in {"h264", "hevc"}
         and audio_codec in {None, "aac"}
-        and (pixel_format is None or pixel_format in {"yuv420p", "yuvj420p"})
+        and (
+            pixel_format is None
+            or pixel_format in {"yuv420p", "yuvj420p", "yuv420p10le"}
+        )
     )
 
-    # Most Instagram/TikTok/Facebook MP4s already satisfy this. Skipping FFmpeg
-    # here removes a complete extra file rewrite from the common path.
-    if safe_codecs and _mp4_has_faststart(path):
+    # Safari/Photos can seek MP4 files over HTTP Range requests even when the
+    # moov atom is not at the front. Do not rewrite an already compatible file:
+    # that extra full-file copy was the main cause of long 99% waits on Render.
+    if safe_codecs:
         return path
 
     update_job(
@@ -162,10 +166,11 @@ def _make_ios_compatible(path: Path, job_id: str) -> Path:
             "-map", "0:v:0",
             "-map", "0:a:0?",
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "22",
+            "-preset", "ultrafast",
+            "-crf", "25",
+            "-threads", "0",
             "-pix_fmt", "yuv420p",
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-vf", "scale=-2:min(1280\\,ih)",
             "-c:a", "aac",
             "-b:a", "160k",
             "-movflags", "+faststart",
@@ -181,7 +186,7 @@ def _make_ios_compatible(path: Path, job_id: str) -> Path:
             check=True,
             capture_output=True,
             text=True,
-            timeout=900,
+            timeout=240,
         )
         if temp.exists() and temp.stat().st_size > 0:
             path.unlink(missing_ok=True)
@@ -295,7 +300,7 @@ def download_video(job_id: str, url: str, platform: str) -> None:
         # removes a separate audio/video merge from the fast path while keeping
         # a compatible 1080p fallback.
         format_selector = (
-            f"b[vcodec^=avc1][acodec^=mp4a][height>=720][height<={max_height}][ext=mp4]/"
+            f"b[vcodec^=avc1][acodec^=mp4a][height<={max_height}][ext=mp4]/"
             f"bv*[vcodec^=avc1][height<={max_height}][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/"
             f"b[vcodec^=avc1][acodec^=mp4a][height<={max_height}][ext=mp4]/"
             f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/"
