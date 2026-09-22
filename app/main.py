@@ -73,7 +73,7 @@ async def cleanup_loop() -> None:
                     relevant_age = (now - reference).total_seconds() / 60
                 except ValueError:
                     relevant_age = settings.job_ttl_minutes + 1
-                ttl = 10 if job.status == "served" else settings.job_ttl_minutes
+                ttl = 30 if job.status == "served" else settings.job_ttl_minutes
                 if relevant_age > ttl:
                     remove_job_file(job)
                     delete_job(job.id)
