@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import struct
 import subprocess
 import threading
 from pathlib import Path
@@ -16,6 +17,7 @@ from .jobs import update_job
 
 
 _DOWNLOAD_SEMAPHORE = threading.BoundedSemaphore(settings.max_concurrent_downloads)
+_TRANSCODE_SEMAPHORE = threading.BoundedSemaphore(1)
 _SAFE_FILENAME_RE = re.compile(r"[^\w\-. ()\[\]\u0600-\u06FF]+", re.UNICODE)
 _POT_PROVIDER_URL = "http://127.0.0.1:4416"
 
@@ -80,30 +82,70 @@ def _probe_codecs(path: Path) -> tuple[str | None, str | None, str | None]:
         return None, None, None
 
 
-def _make_ios_compatible(path: Path, job_id: str) -> Path:
-    video_codec, audio_codec, pixel_format = _probe_codecs(path)
-    temp = path.with_name(f"{path.stem}.ios.mp4")
+def _mp4_has_faststart(path: Path) -> bool:
+    """Return True when the MP4 moov atom is before mdat without reading the file into memory."""
+    if path.suffix.lower() not in {".mp4", ".m4v", ".mov"}:
+        return False
+    try:
+        file_size = path.stat().st_size
+        with path.open("rb") as stream:
+            offset = 0
+            for _ in range(128):
+                if offset + 8 > file_size:
+                    break
+                stream.seek(offset)
+                header = stream.read(8)
+                if len(header) != 8:
+                    break
+                size = struct.unpack(">I", header[:4])[0]
+                box_type = header[4:8]
+                header_size = 8
+                if size == 1:
+                    extended = stream.read(8)
+                    if len(extended) != 8:
+                        return False
+                    size = struct.unpack(">Q", extended)[0]
+                    header_size = 16
+                elif size == 0:
+                    size = file_size - offset
+                if size < header_size or offset + size > file_size:
+                    return False
+                if box_type == b"moov":
+                    return True
+                if box_type == b"mdat":
+                    return False
+                offset += size
+    except OSError:
+        pass
+    return False
 
-    # H.264 + AAC is the safest common target for Safari, iOS Photos and the
-    # native share sheet. If the codecs are already right, only remux so the
-    # MP4 metadata (moov atom) is moved to the front for immediate playback.
-    already_safe = (
+
+def _make_ios_compatible(path: Path, job_id: str) -> Path:
+    """Normalize only when the source is not already Safari/Photos friendly."""
+    video_codec, audio_codec, pixel_format = _probe_codecs(path)
+    safe_codecs = (
         path.suffix.lower() == ".mp4"
         and video_codec == "h264"
         and audio_codec in {None, "aac"}
         and (pixel_format is None or pixel_format in {"yuv420p", "yuvj420p"})
     )
 
+    # Most Instagram/TikTok/Facebook MP4s already satisfy this. Skipping FFmpeg
+    # here removes a complete extra file rewrite from the common path.
+    if safe_codecs and _mp4_has_faststart(path):
+        return path
+
     update_job(
         job_id,
         status="processing",
         phase="processing",
-        progress=100,
+        progress=99,
         speed_bps=None,
         eta_seconds=None,
     )
 
-    if already_safe:
+    temp = path.with_name(f"{path.stem}.ios.mp4")
+    if safe_codecs:
         command = [
             "ffmpeg", "-y", "-v", "error",
             "-i", str(path),
@@ -130,6 +172,9 @@ def _make_ios_compatible(path: Path, job_id: str) -> Path:
             str(temp),
         ]
 
+    acquired = _TRANSCODE_SEMAPHORE.acquire(timeout=300)
+    if not acquired:
+        return path
     try:
         subprocess.run(
             command,
@@ -139,14 +184,13 @@ def _make_ios_compatible(path: Path, job_id: str) -> Path:
             timeout=900,
         )
         if temp.exists() and temp.stat().st_size > 0:
-            if path.exists():
-                path.unlink()
+            path.unlink(missing_ok=True)
             return temp
     except Exception:
         temp.unlink(missing_ok=True)
+    finally:
+        _TRANSCODE_SEMAPHORE.release()
 
-    # Do not destroy an otherwise downloadable file if FFmpeg normalization
-    # fails for an unusual source.
     return path
 
 
@@ -239,7 +283,7 @@ def download_video(job_id: str, url: str, platform: str) -> None:
                 job_id,
                 status="processing",
                 phase="processing",
-                progress=100,
+                progress=99,
                 speed_bps=None,
                 eta_seconds=None,
             )
@@ -247,6 +291,17 @@ def download_video(job_id: str, url: str, platform: str) -> None:
     max_height = settings.download_max_height
 
     def base_opts() -> dict[str, Any]:
+        # Prefer a progressive H.264/AAC MP4 at 720p+ when available. This
+        # removes a separate audio/video merge from the fast path while keeping
+        # a compatible 1080p fallback.
+        format_selector = (
+            f"b[vcodec^=avc1][acodec^=mp4a][height>=720][height<={max_height}][ext=mp4]/"
+            f"bv*[vcodec^=avc1][height<={max_height}][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/"
+            f"b[vcodec^=avc1][acodec^=mp4a][height<={max_height}][ext=mp4]/"
+            f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/"
+            f"b[height<={max_height}][ext=mp4]/"
+            f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b"
+        )
         return {
             "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
             "noplaylist": True,
@@ -255,22 +310,13 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             "restrictfilenames": False,
             "progress_hooks": [hook],
             "postprocessor_hooks": [postprocessor_hook],
-            "retries": 2,
-            "fragment_retries": 2,
-            "socket_timeout": 25,
-            "concurrent_fragment_downloads": 2,
+            "retries": 3,
+            "fragment_retries": 3,
+            "socket_timeout": 30,
+            "concurrent_fragment_downloads": 4,
             "max_filesize": settings.max_video_bytes,
             "merge_output_format": "mp4",
-            "format": (
-                f"bv*[vcodec^=avc1][height<={max_height}][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/"
-                f"b[vcodec^=avc1][acodec^=mp4a][height<={max_height}][ext=mp4]/"
-                f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/"
-                f"b[height<={max_height}][ext=mp4]/"
-                f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b"
-            ),
-            "postprocessors": [
-                {"key": "FFmpegMetadata", "add_metadata": False},
-            ],
+            "format": format_selector,
         }
 
     attempts: list[dict[str, Any]] = [base_opts()]
@@ -328,7 +374,7 @@ def download_video(job_id: str, url: str, platform: str) -> None:
 
         attempts = [pot, pot_legacy, web_pot, default_clients, hls]
 
-    acquired = _DOWNLOAD_SEMAPHORE.acquire(timeout=120)
+    acquired = _DOWNLOAD_SEMAPHORE.acquire(timeout=300)
     if not acquired:
         update_job(job_id, status="error", error="الخادم مشغول حاليًا. حاول بعد قليل.")
         return
@@ -388,19 +434,14 @@ def download_video(job_id: str, url: str, platform: str) -> None:
                 final_path.unlink()
             output.replace(final_path)
 
+        final_size = final_path.stat().st_size
         update_job(
             job_id,
             status="ready",
             progress=100,
             phase="ready",
-            downloaded_bytes=max(
-                sum(item["downloaded"] for item in stream_state.values()),
-                sum(item["total"] for item in stream_state.values()),
-            ),
-            total_bytes=max(
-                expected_total_bytes,
-                sum(item["total"] for item in stream_state.values()),
-            ),
+            downloaded_bytes=final_size,
+            total_bytes=final_size,
             speed_bps=None,
             eta_seconds=0,
             platform=platform,
@@ -411,7 +452,7 @@ def download_video(job_id: str, url: str, platform: str) -> None:
         )
     except DownloadTooLarge:
         shutil.rmtree(job_dir, ignore_errors=True)
-        update_job(job_id, status="error", error=f"حجم الفيديو يتجاوز الحد المسموح ({settings.max_video_mb} MB).")
+        update_job(job_id, status="error", phase="error", error=f"حجم الفيديو يتجاوز الحد المسموح ({settings.max_video_mb} MB).")
     except DownloadError as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         message = str(exc).lower()
@@ -444,9 +485,9 @@ def download_video(job_id: str, url: str, platform: str) -> None:
         else:
             user_error = "تعذر تجهيز الفيديو من هذا الرابط. قد تكون المنصة غيّرت طريقة الوصول إليه."
 
-        update_job(job_id, status="error", error=user_error)
+        update_job(job_id, status="error", phase="error", error=user_error)
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
-        update_job(job_id, status="error", error="حدث خطأ غير متوقع أثناء تجهيز الفيديو.")
+        update_job(job_id, status="error", phase="error", error="حدث خطأ غير متوقع أثناء تجهيز الفيديو.")
     finally:
         _DOWNLOAD_SEMAPHORE.release()
