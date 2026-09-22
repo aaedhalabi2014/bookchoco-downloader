@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import Lock
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -78,7 +79,6 @@ async def cleanup_loop() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    # Any interrupted jobs from a previous restart should not stay stuck forever.
     for job in list_jobs():
         if job.status not in {"ready", "error"}:
             update_job(job.id, status="error", error="توقفت عملية سابقة قبل اكتمالها. أعد المحاولة.")
@@ -95,6 +95,14 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None if settings.app_env == "production" else "/openapi.json",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[settings.frontend_origin],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -155,9 +163,6 @@ def download(job_id: str):
         delete_job(job_id)
         raise HTTPException(status_code=410, detail="انتهت صلاحية الملف. أعد تجهيز الرابط.")
 
-    # Keep the temporary file briefly after the first request because Safari and
-    # download managers may issue follow-up Range requests. The cleanup loop
-    # removes served files automatically after 10 minutes.
     update_job(job_id, status="served")
 
     return FileResponse(
