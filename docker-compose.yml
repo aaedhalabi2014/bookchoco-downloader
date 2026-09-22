@@ -1,0 +1,20 @@
+services:
+  downloader:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - runtime:/app/runtime
+    ports:
+      - "127.0.0.1:8000:8000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2.0
+
+volumes:
+  runtime:
