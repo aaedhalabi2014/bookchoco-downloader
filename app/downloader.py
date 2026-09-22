@@ -136,10 +136,15 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             "youtubepot-bgutilhttp": [f"base_url={_POT_PROVIDER_URL}"],
         }
 
-        # Force IPv4 for yt-dlp's media requests on cloud hosts. This does not
-        # change the provider's loopback connection.
+        # Route YouTube only through an optional residential/ISP proxy.
+        # Keeping the same proxy for extraction and media downloading avoids
+        # mixing the Render datacenter IP with the proxy IP during one job.
+        youtube_proxy = settings.youtube_proxy_url.strip()
         for attempt in (pot, pot_legacy, web_pot, default_clients, hls):
-            attempt["source_address"] = "0.0.0.0"
+            if youtube_proxy:
+                attempt["proxy"] = youtube_proxy
+            else:
+                attempt["source_address"] = "0.0.0.0"
 
         attempts = [pot, pot_legacy, web_pot, default_clients, hls]
 
@@ -209,10 +214,14 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             token in message
             for token in ("confirm you're not a bot", "login_required", "po token", "http error 403")
         ):
-            user_error = (
-                "YouTube ما زال يرفض عنوان خادم Render لهذا الرابط رغم محاولة التحقق الآلية. "
-                "هذا ليس لأن الفيديو خاص."
-            )
+            if settings.youtube_proxy_url.strip():
+                user_error = (
+                    "YouTube رفض عنوان البروكسي الحالي. جرّب تبديل IP البروكسي أو جلسة جديدة."
+                )
+            else:
+                user_error = (
+                    "YouTube يرفض عنوان خادم Render. فعّل YOUTUBE_PROXY_URL ببروكسي ISP/Residential."
+                )
         elif any(
             token in message
             for token in (
