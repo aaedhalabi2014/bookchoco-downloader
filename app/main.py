@@ -43,7 +43,18 @@ def _rate_limited(client_ip: str) -> bool:
         return False
 
 
+def _file_size(job) -> int:
+    if not job.file_path:
+        return 0
+    try:
+        path = Path(job.file_path)
+        return path.stat().st_size if path.is_file() else 0
+    except OSError:
+        return 0
+
+
 def _public_job(job) -> dict[str, object]:
+    ready = job.status in {"ready", "served"}
     return {
         "id": job.id,
         "status": job.status,
@@ -57,8 +68,9 @@ def _public_job(job) -> dict[str, object]:
         "total_bytes": job.total_bytes,
         "speed_bps": job.speed_bps,
         "eta_seconds": job.eta_seconds,
-        "ready": job.status in {"ready", "served"},
-        "download_url": f"/api/jobs/{job.id}/download" if job.status in {"ready", "served"} else None,
+        "file_size_bytes": _file_size(job) if ready else 0,
+        "ready": ready,
+        "download_url": f"/api/jobs/{job.id}/download" if ready else None,
     }
 
 
@@ -86,7 +98,7 @@ async def lifespan(_: FastAPI):
     init_db()
     for job in list_jobs():
         if job.status not in {"ready", "error"}:
-            update_job(job.id, status="error", error="توقفت عملية سابقة قبل اكتمالها. أعد المحاولة.")
+            update_job(job.id, status="error", phase="error", error="توقفت عملية سابقة قبل اكتمالها. أعد المحاولة.")
     cleaner = asyncio.create_task(cleanup_loop())
     try:
         yield
@@ -106,8 +118,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_methods=["GET", "HEAD", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Range"],
+    expose_headers=["Content-Length", "Content-Disposition", "Accept-Ranges", "Content-Range"],
+    max_age=86400,
 )
 
 
@@ -168,7 +182,7 @@ def download(job_id: str, preview: bool = False):
         delete_job(job_id)
         raise HTTPException(status_code=410, detail="انتهت صلاحية الملف. أعد تجهيز الرابط.")
 
-    update_job(job_id, status="served")
+    update_job(job_id, status="served", phase="ready")
 
     suffix = path.suffix.lower()
     media_type = {
@@ -178,7 +192,7 @@ def download(job_id: str, preview: bool = False):
         ".webm": "video/webm",
     }.get(suffix, "application/octet-stream")
 
-    headers = {"Cache-Control": "no-store"}
+    headers = {"Cache-Control": "private, no-store", "Accept-Ranges": "bytes"}
     if not preview:
         headers["X-Download-Options"] = "noopen"
 
