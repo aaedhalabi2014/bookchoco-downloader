@@ -28,6 +28,11 @@ class Job:
     error: str | None
     created_at: str
     updated_at: str
+    downloaded_bytes: int = 0
+    total_bytes: int = 0
+    speed_bps: float | None = None
+    eta_seconds: int | None = None
+    phase: str = "queued"
 
 
 def _connect() -> sqlite3.Connection:
@@ -50,20 +55,54 @@ def init_db() -> None:
                 file_path TEXT,
                 error TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                total_bytes INTEGER NOT NULL DEFAULT 0,
+                speed_bps REAL,
+                eta_seconds INTEGER,
+                phase TEXT NOT NULL DEFAULT 'queued'
             )
             """
         )
+
+        # Additive migration for existing Render instances that already have
+        # the earlier jobs table.
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        migrations = {
+            "downloaded_bytes": "INTEGER NOT NULL DEFAULT 0",
+            "total_bytes": "INTEGER NOT NULL DEFAULT 0",
+            "speed_bps": "REAL",
+            "eta_seconds": "INTEGER",
+            "phase": "TEXT NOT NULL DEFAULT 'queued'",
+        }
+        for name, definition in migrations.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
         conn.commit()
 
 
 def create_job(job_id: str, platform: str) -> Job:
     now = utc_now()
-    job = Job(job_id, "queued", 0, platform, None, None, None, None, now, now)
+    job = Job(
+        id=job_id,
+        status="queued",
+        progress=0,
+        platform=platform,
+        title=None,
+        filename=None,
+        file_path=None,
+        error=None,
+        created_at=now,
+        updated_at=now,
+        phase="queued",
+    )
+    data = asdict(job)
+    columns = ", ".join(data.keys())
+    placeholders = ", ".join("?" for _ in data)
     with _DB_LOCK, _connect() as conn:
         conn.execute(
-            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            tuple(asdict(job).values()),
+            f"INSERT INTO jobs ({columns}) VALUES ({placeholders})",
+            tuple(data.values()),
         )
         conn.commit()
     return job
@@ -78,8 +117,23 @@ def get_job(job_id: str) -> Job | None:
 def update_job(job_id: str, **fields: object) -> None:
     if not fields:
         return
-    allowed = {"status", "progress", "platform", "title", "filename", "file_path", "error"}
+    allowed = {
+        "status",
+        "progress",
+        "platform",
+        "title",
+        "filename",
+        "file_path",
+        "error",
+        "downloaded_bytes",
+        "total_bytes",
+        "speed_bps",
+        "eta_seconds",
+        "phase",
+    }
     clean = {k: v for k, v in fields.items() if k in allowed}
+    if not clean:
+        return
     clean["updated_at"] = utc_now()
     assignments = ", ".join(f"{key} = ?" for key in clean)
     values = list(clean.values()) + [job_id]
