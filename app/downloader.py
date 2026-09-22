@@ -160,6 +160,8 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             "max_filesize": settings.max_video_bytes,
             "merge_output_format": "mp4",
             "format": (
+                f"bv*[vcodec^=avc1][height<={max_height}][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/"
+                f"b[vcodec^=avc1][acodec^=mp4a][height<={max_height}][ext=mp4]/"
                 f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/"
                 f"b[height<={max_height}][ext=mp4]/"
                 f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b"
@@ -192,6 +194,7 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             "youtubepot-bgutilhttp": [f"base_url={_POT_PROVIDER_URL}"],
         }
         hls["format"] = (
+            f"b[protocol^=m3u8][vcodec^=avc1][height<={max_height}]/"
             f"b[protocol^=m3u8][height<={max_height}]/"
             f"bv*[protocol^=m3u8][height<={max_height}]+ba[protocol^=m3u8]/"
             f"b[height<={max_height}]/b"
