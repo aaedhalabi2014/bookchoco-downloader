@@ -235,6 +235,8 @@ def download_video(job_id: str, url: str, platform: str) -> None:
         for index, ydl_opts in enumerate(attempts):
             if index:
                 _reset_job_dir(job_dir)
+                stream_state.clear()
+                expected_total_bytes = 0
                 last_progress = -1
 
             update_job(
