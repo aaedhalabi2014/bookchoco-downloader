@@ -42,6 +42,11 @@ def _select_output(job_dir: Path) -> Path:
     return max(candidates, key=lambda p: p.stat().st_size)
 
 
+def _reset_job_dir(job_dir: Path) -> None:
+    shutil.rmtree(job_dir, ignore_errors=True)
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+
 def download_video(job_id: str, url: str, platform: str) -> None:
     job_dir = DOWNLOAD_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -62,30 +67,59 @@ def download_video(job_id: str, url: str, platform: str) -> None:
         elif status == "finished":
             update_job(job_id, status="processing", progress=95)
 
-    outtmpl = str(job_dir / "%(id)s.%(ext)s")
     max_height = settings.download_max_height
-    ydl_opts: dict[str, Any] = {
-        "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "restrictfilenames": False,
-        "progress_hooks": [hook],
-        "retries": 2,
-        "fragment_retries": 2,
-        "socket_timeout": 20,
-        "concurrent_fragment_downloads": 2,
-        "max_filesize": settings.max_video_bytes,
-        "merge_output_format": "mp4",
-        "format": (
-            f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/"
-            f"b[height<={max_height}][ext=mp4]/"
-            f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b"
-        ),
-        "postprocessors": [
-            {"key": "FFmpegMetadata", "add_metadata": False},
-        ],
-    }
+
+    def base_opts() -> dict[str, Any]:
+        return {
+            "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "restrictfilenames": False,
+            "progress_hooks": [hook],
+            "retries": 2,
+            "fragment_retries": 2,
+            "socket_timeout": 25,
+            "concurrent_fragment_downloads": 2,
+            "max_filesize": settings.max_video_bytes,
+            "merge_output_format": "mp4",
+            "format": (
+                f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/"
+                f"b[height<={max_height}][ext=mp4]/"
+                f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b"
+            ),
+            "postprocessors": [
+                {"key": "FFmpegMetadata", "add_metadata": False},
+            ],
+        }
+
+    # YouTube currently applies different bot/PO-token requirements to different
+    # player clients. Try the normal extractor first, then a conservative set of
+    # public clients that yt-dlp documents as useful fallbacks.
+    attempts: list[dict[str, Any]] = [base_opts()]
+    if platform == "YouTube":
+        fallback = base_opts()
+        fallback["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android_vr", "web_embedded", "tv_simply", "web_safari"],
+            }
+        }
+        attempts.append(fallback)
+
+        # Last free fallback: prefer HLS when web_safari exposes it. This can
+        # work when direct GVS formats are gated behind a PO token.
+        hls_fallback = base_opts()
+        hls_fallback["extractor_args"] = {
+            "youtube": {
+                "player_client": ["web_safari", "android_vr", "web_embedded"],
+            }
+        }
+        hls_fallback["format"] = (
+            f"b[protocol^=m3u8][height<={max_height}]/"
+            f"bv*[protocol^=m3u8][height<={max_height}]+ba[protocol^=m3u8]/"
+            f"b[height<={max_height}]/b"
+        )
+        attempts.append(hls_fallback)
 
     acquired = _DOWNLOAD_SEMAPHORE.acquire(timeout=120)
     if not acquired:
@@ -93,16 +127,38 @@ def download_video(job_id: str, url: str, platform: str) -> None:
         return
 
     try:
-        update_job(job_id, status="preparing", progress=3)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            clean = ydl.sanitize_info(info)
+        clean: dict[str, Any] | None = None
+        last_error: DownloadError | None = None
+
+        for index, ydl_opts in enumerate(attempts):
+            if index:
+                _reset_job_dir(job_dir)
+                last_progress = -1
+                update_job(job_id, status="preparing", progress=3)
+            else:
+                update_job(job_id, status="preparing", progress=3)
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    sanitized = ydl.sanitize_info(info)
+                    clean = sanitized if isinstance(sanitized, dict) else None
+                last_error = None
+                break
+            except DownloadError as exc:
+                last_error = exc
+                if platform != "YouTube" or index == len(attempts) - 1:
+                    raise
+                continue
+
+        if last_error is not None:
+            raise last_error
 
         output = _select_output(job_dir)
         if output.stat().st_size > settings.max_video_bytes:
             raise DownloadTooLarge
 
-        title = _clean_title(clean.get("title") if isinstance(clean, dict) else None)
+        title = _clean_title(clean.get("title") if clean else None)
         extension = output.suffix.lower() or ".mp4"
         final_name = f"{title}{extension}"
         final_path = job_dir / final_name
@@ -127,12 +183,22 @@ def download_video(job_id: str, url: str, platform: str) -> None:
     except DownloadError as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         message = str(exc).lower()
-        if any(token in message for token in ("login", "private", "sign in", "cookies", "age")):
-            user_error = "الفيديو غير متاح كرابط عام، أو يحتاج تسجيل دخول."
+
+        if platform == "YouTube" and any(
+            token in message
+            for token in ("confirm you're not a bot", "sign in", "login_required", "po token", "http error 403")
+        ):
+            user_error = (
+                "الفيديو عام، لكن YouTube رفض اتصال خادم التحميل مؤقتًا بسبب حماية البوتات. "
+                "جرّب مرة ثانية بعد قليل."
+            )
+        elif any(token in message for token in ("private", "members-only", "age-restricted", "cookies")):
+            user_error = "الفيديو يحتاج صلاحية أو تسجيل دخول ولا يمكن تنزيله كرابط عام."
         elif "unsupported url" in message:
             user_error = "هذا الرابط غير مدعوم حاليًا."
         else:
             user_error = "تعذر تجهيز الفيديو من هذا الرابط. قد تكون المنصة غيّرت طريقة الوصول إليه."
+
         update_job(job_id, status="error", error=user_error)
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
