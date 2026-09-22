@@ -52,6 +52,11 @@ def _public_job(job) -> dict[str, object]:
         "title": job.title,
         "filename": job.filename,
         "error": job.error,
+        "phase": job.phase,
+        "downloaded_bytes": job.downloaded_bytes,
+        "total_bytes": job.total_bytes,
+        "speed_bps": job.speed_bps,
+        "eta_seconds": job.eta_seconds,
         "ready": job.status in {"ready", "served"},
         "download_url": f"/api/jobs/{job.id}/download" if job.status in {"ready", "served"} else None,
     }
