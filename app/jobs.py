@@ -17,6 +17,16 @@ def utc_now() -> str:
 
 
 @dataclass
+class Analysis:
+    id: str
+    source_url: str
+    platform: str
+    title: str
+    formats_json: str
+    created_at: str
+
+
+@dataclass
 class Job:
     id: str
     status: str
@@ -78,7 +88,49 @@ def init_db() -> None:
         for name, definition in migrations.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analyses (
+                id TEXT PRIMARY KEY,
+                source_url TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                title TEXT NOT NULL,
+                formats_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
+
+
+def create_analysis(analysis_id: str, source_url: str, platform: str, title: str, formats_json: str) -> Analysis:
+    created_at = utc_now()
+    analysis = Analysis(analysis_id, source_url, platform, title, formats_json, created_at)
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(
+            "INSERT INTO analyses (id, source_url, platform, title, formats_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (analysis.id, analysis.source_url, analysis.platform, analysis.title, analysis.formats_json, analysis.created_at),
+        )
+        conn.commit()
+    return analysis
+
+
+def get_analysis(analysis_id: str) -> Analysis | None:
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute("SELECT * FROM analyses WHERE id = ?", (analysis_id,)).fetchone()
+    return Analysis(**dict(row)) if row else None
+
+
+def delete_analysis(analysis_id: str) -> None:
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("DELETE FROM analyses WHERE id = ?", (analysis_id,))
+        conn.commit()
+
+
+def list_analyses() -> list[Analysis]:
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute("SELECT * FROM analyses").fetchall()
+    return [Analysis(**dict(row)) for row in rows]
 
 
 def create_job(job_id: str, platform: str) -> Job:
