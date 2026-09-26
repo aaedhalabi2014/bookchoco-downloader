@@ -14,6 +14,7 @@ try:
 except Exception:  # optional runtime acceleration/impersonation
     curl_requests = None
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 from yt_dlp.utils import DownloadError
 
 from .config import settings
@@ -90,12 +91,22 @@ def _base_opts(platform: str) -> dict[str, Any]:
         "retries": 2,
         "extract_flat": False,
     }
+    proxy = settings.youtube_proxy_url.strip()
+
+    if platform == "Facebook":
+        # Facebook currently fingerprints TLS/HTTP behavior on some public
+        # video endpoints. yt-dlp's documented workaround is browser
+        # impersonation; route through the existing ISP proxy as well so
+        # Facebook does not see Render's datacenter egress.
+        opts["impersonate"] = ImpersonateTarget.from_str("chrome-99")
+        if proxy:
+            opts["proxy"] = proxy
+
     if platform == "YouTube":
         opts["extractor_args"] = {
             "youtube": ["player_client=mweb"],
             "youtubepot-bgutilhttp": [f"base_url={_POT_PROVIDER_URL}"],
         }
-        proxy = settings.youtube_proxy_url.strip()
         if proxy:
             opts["proxy"] = proxy
         else:
@@ -166,18 +177,9 @@ def _facebook_title(page: str) -> str:
 
 
 def canonicalize_facebook_url(url: str) -> str:
-    """Resolve Facebook share/reel URLs to a stable mobile watch URL when possible."""
-    headers = {
-        "User-Agent": _FACEBOOK_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    try:
-        with httpx.Client(follow_redirects=True, timeout=15.0, headers=headers) as client:
-            response = client.get(url)
-            final_url = str(response.url)
-    except httpx.HTTPError:
-        return url
+    """Resolve Facebook share/reel URLs through the same browser-like path used for extraction."""
+    fetched = _facebook_fetch_page(url)
+    final_url = fetched[0] if fetched is not None else url
 
     parts = urlsplit(final_url)
     candidates = [
@@ -200,6 +202,8 @@ def _facebook_fetch_page(url: str) -> tuple[str, str] | None:
         "Cache-Control": "no-cache",
     }
 
+    proxy = settings.youtube_proxy_url.strip() or None
+
     if curl_requests is not None:
         try:
             response = curl_requests.get(
@@ -207,7 +211,8 @@ def _facebook_fetch_page(url: str) -> tuple[str, str] | None:
                 headers=headers,
                 allow_redirects=True,
                 timeout=20,
-                impersonate="chrome",
+                impersonate="chrome99",
+                proxy=proxy,
             )
             if response.status_code == 200:
                 return str(response.url), response.text
@@ -215,7 +220,12 @@ def _facebook_fetch_page(url: str) -> tuple[str, str] | None:
             pass
 
     try:
-        with httpx.Client(follow_redirects=True, timeout=20.0, headers=headers) as client:
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=20.0,
+            headers=headers,
+            proxy=proxy,
+        ) as client:
             response = client.get(url)
             if response.status_code == 200:
                 return str(response.url), response.text
