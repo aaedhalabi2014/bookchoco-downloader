@@ -129,11 +129,6 @@ def analyze_media(url: str, platform: str) -> dict[str, Any]:
         if ext not in {"mp4", "m4v"}:
             continue
 
-        try:
-            validate_extracted_url(direct_url)
-        except AnalyzeFailed:
-            continue
-
         height = int(fmt.get("height") or 0)
         width = int(fmt.get("width") or 0)
         fps = float(fmt.get("fps") or 0)
