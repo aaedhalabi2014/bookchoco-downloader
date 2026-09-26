@@ -157,6 +157,33 @@ def _facebook_title(page: str) -> str:
     return "Facebook video"
 
 
+def canonicalize_facebook_url(url: str) -> str:
+    """Resolve Facebook share/reel URLs to a stable mobile watch URL when possible."""
+    headers = {
+        "User-Agent": _FACEBOOK_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        with httpx.Client(follow_redirects=True, timeout=15.0, headers=headers) as client:
+            response = client.get(url)
+            final_url = str(response.url)
+    except httpx.HTTPError:
+        return url
+
+    parts = urlsplit(final_url)
+    candidates = [
+        re.search(r"/videos/(\d+)", parts.path or ""),
+        re.search(r"/reel/(\d+)", parts.path or ""),
+        re.search(r"[?&]v=(\d+)", final_url),
+    ]
+    for match in candidates:
+        if match:
+            return f"https://m.facebook.com/watch/?v={match.group(1)}"
+
+    return final_url or url
+
+
 def _facebook_pages(url: str) -> list[tuple[str, str]]:
     headers = {
         "User-Agent": _FACEBOOK_UA,
@@ -231,14 +258,18 @@ def _analyze_facebook(url: str) -> dict[str, Any] | None:
     return {"title": title, "formats": formats}
 
 def analyze_media(url: str, platform: str) -> dict[str, Any]:
+    target_url = url
     if platform == "Facebook":
+        target_url = canonicalize_facebook_url(url)
         facebook = _analyze_facebook(url)
+        if not (facebook and facebook.get("formats")) and target_url != url:
+            facebook = _analyze_facebook(target_url)
         if facebook and facebook.get("formats"):
             return facebook
 
     try:
         with yt_dlp.YoutubeDL(_base_opts(platform)) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(target_url, download=False)
     except DownloadError as exc:
         raise AnalyzeFailed(str(exc)) from exc
 
