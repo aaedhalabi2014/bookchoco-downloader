@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 from yt_dlp.utils import DownloadError
 
 from .config import DOWNLOAD_DIR, settings
@@ -307,7 +308,7 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             f"b[height<={max_height}][ext=mp4]/"
             f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b"
         )
-        return {
+        opts: dict[str, Any] = {
             "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
             "noplaylist": True,
             "quiet": True,
@@ -323,6 +324,14 @@ def download_video(job_id: str, url: str, platform: str) -> None:
             "merge_output_format": "mp4",
             "format": format_selector,
         }
+
+        if platform == "Facebook":
+            opts["impersonate"] = ImpersonateTarget.from_str("chrome-99")
+            proxy = settings.youtube_proxy_url.strip()
+            if proxy:
+                opts["proxy"] = proxy
+
+        return opts
 
     attempts: list[dict[str, Any]] = [base_opts()]
 
