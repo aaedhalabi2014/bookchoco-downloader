@@ -6,9 +6,13 @@ import json
 import re
 import socket
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
+try:
+    from curl_cffi import requests as curl_requests
+except Exception:  # optional runtime acceleration/impersonation
+    curl_requests = None
 import yt_dlp
 from yt_dlp.utils import DownloadError
 
@@ -127,9 +131,13 @@ def _facebook_variant_urls(page: str) -> list[tuple[str, str]]:
         ("HD", r'"browser_native_hd_url"\s*:\s*"([^"]+)"'),
         ("HD", r'"playable_url_quality_hd"\s*:\s*"([^"]+)"'),
         ("HD", r'"hd_src"\s*:\s*"([^"]+)"'),
+        ("HD", r'"hd_src_no_ratelimit"\s*:\s*"([^"]+)"'),
         ("SD", r'"browser_native_sd_url"\s*:\s*"([^"]+)"'),
         ("SD", r'"playable_url"\s*:\s*"([^"]+)"'),
         ("SD", r'"sd_src"\s*:\s*"([^"]+)"'),
+        ("SD", r'"sd_src_no_ratelimit"\s*:\s*"([^"]+)"'),
+        ("MP4", r'<video[^>]+src=["\']([^"\']+\.mp4[^"\']*)["\']'),
+        ("MP4", r'"(?:video_url|videoURL|src)"\s*:\s*"([^"]*fbcdn[^"]*\.mp4[^"]*)"'),
     ]
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -184,32 +192,68 @@ def canonicalize_facebook_url(url: str) -> str:
     return final_url or url
 
 
-def _facebook_pages(url: str) -> list[tuple[str, str]]:
+def _facebook_fetch_page(url: str) -> tuple[str, str] | None:
     headers = {
         "User-Agent": _FACEBOOK_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
     }
-    pages: list[tuple[str, str]] = []
-    with httpx.Client(follow_redirects=True, timeout=20.0, headers=headers) as client:
-        response = client.get(url)
-        response.raise_for_status()
-        final_url = str(response.url)
-        pages.append((final_url, response.text))
 
-        # Facebook often serves richer public video metadata from the mobile
-        # hostname than from the desktop page for share/reel URLs.
+    if curl_requests is not None:
+        try:
+            response = curl_requests.get(
+                url,
+                headers=headers,
+                allow_redirects=True,
+                timeout=20,
+                impersonate="chrome",
+            )
+            if response.status_code == 200:
+                return str(response.url), response.text
+        except Exception:
+            pass
+
+    try:
+        with httpx.Client(follow_redirects=True, timeout=20.0, headers=headers) as client:
+            response = client.get(url)
+            if response.status_code == 200:
+                return str(response.url), response.text
+    except httpx.HTTPError:
+        pass
+    return None
+
+
+def _facebook_pages(url: str) -> list[tuple[str, str]]:
+    pages: list[tuple[str, str]] = []
+    seen_urls: set[str] = set()
+
+    def add(candidate: str) -> None:
+        if not candidate or candidate in seen_urls:
+            return
+        seen_urls.add(candidate)
+        fetched = _facebook_fetch_page(candidate)
+        if fetched is not None:
+            pages.append(fetched)
+
+    add(url)
+
+    if pages:
+        final_url = pages[0][0]
         parts = urlsplit(final_url)
         if parts.hostname and parts.hostname.endswith("facebook.com"):
             mobile = urlunsplit((parts.scheme or "https", "m.facebook.com", parts.path, parts.query, ""))
-            if mobile != final_url:
-                try:
-                    mobile_response = client.get(mobile)
-                    if mobile_response.status_code == 200:
-                        pages.append((str(mobile_response.url), mobile_response.text))
-                except httpx.HTTPError:
-                    pass
+            add(mobile)
+
+    # Facebook's public embed endpoint often contains the actual playable
+    # fbcdn URL even when the regular share/reel page is login/cookie gated.
+    plugin_url = (
+        "https://www.facebook.com/plugins/video.php?href="
+        + quote(url, safe="")
+        + "&show_text=false&width=560"
+    )
+    add(plugin_url)
+
     return pages
 
 
