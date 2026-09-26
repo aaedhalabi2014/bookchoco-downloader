@@ -34,7 +34,7 @@ from .jobs import (
     update_job,
 )
 from .security import URLValidationError, validate_public_media_url
-from .resolver import AnalyzeFailed, analyze_media, validate_extracted_url
+from .resolver import AnalyzeFailed, analyze_media, canonicalize_facebook_url, validate_extracted_url
 
 
 STATIC_DIR = BASE_DIR / "static"
@@ -317,7 +317,8 @@ def new_job(payload: CreateJobRequest, request: Request, background_tasks: Backg
 
     job_id = uuid.uuid4().hex
     job = create_job(job_id, valid.platform)
-    background_tasks.add_task(download_video, job_id, valid.url, valid.platform)
+    source_url = canonicalize_facebook_url(valid.url) if valid.platform == "Facebook" else valid.url
+    background_tasks.add_task(download_video, job_id, source_url, valid.platform)
     return _public_job(job)
 
 
