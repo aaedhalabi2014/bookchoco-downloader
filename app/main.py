@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 import uuid
 from collections import defaultdict, deque
@@ -11,14 +13,28 @@ from threading import Lock
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+import httpx
 
 from .config import BASE_DIR, settings
 from .downloader import download_video
-from .jobs import create_job, delete_job, get_job, init_db, list_jobs, remove_job_file, update_job
+from .jobs import (
+    create_analysis,
+    create_job,
+    delete_analysis,
+    delete_job,
+    get_analysis,
+    get_job,
+    init_db,
+    list_analyses,
+    list_jobs,
+    remove_job_file,
+    update_job,
+)
 from .security import URLValidationError, validate_public_media_url
+from .resolver import AnalyzeFailed, analyze_media, validate_extracted_url
 
 
 STATIC_DIR = BASE_DIR / "static"
@@ -27,6 +43,10 @@ _RATE_LOCK = Lock()
 
 
 class CreateJobRequest(BaseModel):
+    url: str = Field(min_length=8, max_length=2048)
+
+
+class ResolveRequest(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
 
 
@@ -78,6 +98,14 @@ async def cleanup_loop() -> None:
     while True:
         try:
             now = datetime.now(timezone.utc)
+            for analysis in list_analyses():
+                try:
+                    created = datetime.fromisoformat(analysis.created_at)
+                    if (now - created).total_seconds() > 15 * 60:
+                        delete_analysis(analysis.id)
+                except ValueError:
+                    delete_analysis(analysis.id)
+
             for job in list_jobs():
                 reference_time = job.updated_at if job.status == "served" else job.created_at
                 try:
@@ -145,6 +173,136 @@ async def security_headers(request: Request, call_next):
 def healthz():
     return {"ok": True}
 
+
+
+@app.post("/api/resolve")
+def resolve_media(payload: ResolveRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if _rate_limited(client_ip):
+        raise HTTPException(status_code=429, detail="طلبات كثيرة خلال وقت قصير. حاول بعد دقيقة.")
+
+    try:
+        valid = validate_public_media_url(payload.url)
+        analyzed = analyze_media(valid.url, valid.platform)
+    except URLValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except AnalyzeFailed as exc:
+        raise HTTPException(status_code=422, detail="تعذر تحليل هذا الرابط بسرعة؛ استخدم التجهيز الكامل.") from exc
+
+    analysis_id = uuid.uuid4().hex
+    stored = json.dumps(analyzed.get("formats") or [], ensure_ascii=False, separators=(",", ":"))
+    create_analysis(
+        analysis_id,
+        valid.url,
+        valid.platform,
+        str(analyzed.get("title") or "video"),
+        stored,
+    )
+    public_formats = []
+    for item in analyzed.get("formats") or []:
+        public_formats.append(
+            {
+                "id": item["id"],
+                "label": item["label"],
+                "height": item["height"],
+                "width": item["width"],
+                "fps": item["fps"],
+                "filesize": item["filesize"],
+                "ext": item["ext"],
+            }
+        )
+
+    return {
+        "id": analysis_id,
+        "platform": valid.platform,
+        "title": str(analyzed.get("title") or "video"),
+        "formats": public_formats,
+        "fallback": len(public_formats) == 0,
+    }
+
+
+def _safe_filename(value: str, ext: str = "mp4") -> str:
+    name = re.sub(r"[^\w\-. ()\[\]\u0600-\u06FF]+", "_", value, flags=re.UNICODE)
+    name = name[:90].strip(" ._") or "video"
+    return f"{name}.{ext}"
+
+
+@app.get("/api/resolve/{analysis_id}/download/{format_id}")
+def resolved_download(analysis_id: str, format_id: str, request: Request, preview: bool = False):
+    analysis = get_analysis(analysis_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="انتهت صلاحية خيارات التحميل. أعد تحليل الرابط.")
+
+    try:
+        created = datetime.fromisoformat(analysis.created_at)
+        if (datetime.now(timezone.utc) - created).total_seconds() > 15 * 60:
+            delete_analysis(analysis_id)
+            raise HTTPException(status_code=410, detail="انتهت صلاحية خيارات التحميل. أعد تحليل الرابط.")
+    except ValueError as exc:
+        delete_analysis(analysis_id)
+        raise HTTPException(status_code=410, detail="انتهت صلاحية خيارات التحميل.") from exc
+
+    try:
+        formats = json.loads(analysis.formats_json)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="بيانات الجودة غير صالحة.") from exc
+
+    selected = next((item for item in formats if str(item.get("id")) == format_id), None)
+    if not selected:
+        raise HTTPException(status_code=404, detail="هذه الجودة لم تعد متاحة.")
+
+    upstream_url = validate_extracted_url(str(selected.get("url") or ""))
+    upstream_headers = {
+        str(k): str(v)
+        for k, v in (selected.get("headers") or {}).items()
+        if isinstance(k, str) and isinstance(v, str)
+    }
+    if request.headers.get("range"):
+        upstream_headers["range"] = request.headers["range"]
+
+    client = httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30.0, read=120.0))
+    try:
+        cm = client.stream("GET", upstream_url, headers=upstream_headers)
+        upstream = cm.__enter__()
+    except Exception as exc:
+        client.close()
+        raise HTTPException(status_code=502, detail="تعذر فتح ملف الفيديو من المصدر.") from exc
+
+    if upstream.status_code not in {200, 206}:
+        upstream.close()
+        cm.__exit__(None, None, None)
+        client.close()
+        raise HTTPException(status_code=502, detail="المصدر رفض تنزيل هذه الجودة.")
+
+    response_headers = {
+        "Cache-Control": "private, no-store",
+        "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
+    }
+    for header in ("content-length", "content-range", "etag", "last-modified"):
+        if upstream.headers.get(header):
+            response_headers[header.title()] = upstream.headers[header]
+
+    ext = str(selected.get("ext") or "mp4").lower()
+    filename = _safe_filename(analysis.title, ext)
+    disposition = "inline" if preview else "attachment"
+    response_headers["Content-Disposition"] = f'{disposition}; filename="{filename.encode("ascii", "ignore").decode() or "video.mp4"}"'
+
+    def iterator():
+        try:
+            for chunk in upstream.iter_bytes(256 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+            cm.__exit__(None, None, None)
+            client.close()
+
+    return StreamingResponse(
+        iterator(),
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type") or "video/mp4",
+        headers=response_headers,
+    )
 
 @app.post("/api/jobs", status_code=202)
 def new_job(payload: CreateJobRequest, request: Request, background_tasks: BackgroundTasks):
