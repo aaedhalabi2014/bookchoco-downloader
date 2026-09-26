@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import html
 import ipaddress
+import json
+import re
 import socket
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 import yt_dlp
 from yt_dlp.utils import DownloadError
 
@@ -95,7 +99,143 @@ def _base_opts(platform: str) -> dict[str, Any]:
     return opts
 
 
+
+
+_FACEBOOK_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 "
+    "Mobile/15E148 Safari/604.1"
+)
+
+
+def _decode_fb_value(raw: str) -> str:
+    value = html.unescape(raw)
+    try:
+        return json.loads(f'"{value}"')
+    except Exception:
+        return (
+            value.replace(r"\/", "/")
+            .replace(r"\u0025", "%")
+            .replace(r"\u0026", "&")
+            .replace(r"\u003D", "=")
+            .replace(r"\u003F", "?")
+        )
+
+
+def _facebook_variant_urls(page: str) -> list[tuple[str, str]]:
+    patterns = [
+        ("HD", r'"browser_native_hd_url"\s*:\s*"([^"]+)"'),
+        ("HD", r'"playable_url_quality_hd"\s*:\s*"([^"]+)"'),
+        ("HD", r'"hd_src"\s*:\s*"([^"]+)"'),
+        ("SD", r'"browser_native_sd_url"\s*:\s*"([^"]+)"'),
+        ("SD", r'"playable_url"\s*:\s*"([^"]+)"'),
+        ("SD", r'"sd_src"\s*:\s*"([^"]+)"'),
+    ]
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for label, pattern in patterns:
+        for match in re.finditer(pattern, page, flags=re.IGNORECASE):
+            url = _decode_fb_value(match.group(1)).strip()
+            if not url.startswith(("http://", "https://")) or url in seen:
+                continue
+            if "fbcdn" not in (urlsplit(url).hostname or "").lower():
+                continue
+            seen.add(url)
+            found.append((label, url))
+    return found
+
+
+def _facebook_title(page: str) -> str:
+    for pattern in (
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']',
+        r"<title>(.*?)</title>",
+    ):
+        match = re.search(pattern, page, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            return html.unescape(re.sub(r"\s+", " ", match.group(1))).strip()[:180]
+    return "Facebook video"
+
+
+def _facebook_pages(url: str) -> list[tuple[str, str]]:
+    headers = {
+        "User-Agent": _FACEBOOK_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+    }
+    pages: list[tuple[str, str]] = []
+    with httpx.Client(follow_redirects=True, timeout=20.0, headers=headers) as client:
+        response = client.get(url)
+        response.raise_for_status()
+        final_url = str(response.url)
+        pages.append((final_url, response.text))
+
+        # Facebook often serves richer public video metadata from the mobile
+        # hostname than from the desktop page for share/reel URLs.
+        parts = urlsplit(final_url)
+        if parts.hostname and parts.hostname.endswith("facebook.com"):
+            mobile = urlunsplit((parts.scheme or "https", "m.facebook.com", parts.path, parts.query, ""))
+            if mobile != final_url:
+                try:
+                    mobile_response = client.get(mobile)
+                    if mobile_response.status_code == 200:
+                        pages.append((str(mobile_response.url), mobile_response.text))
+                except httpx.HTTPError:
+                    pass
+    return pages
+
+
+def _analyze_facebook(url: str) -> dict[str, Any] | None:
+    try:
+        pages = _facebook_pages(url)
+    except httpx.HTTPError:
+        return None
+
+    title = "Facebook video"
+    variants: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for page_url, page in pages:
+        if title == "Facebook video":
+            title = _facebook_title(page) or title
+        for label, direct_url in _facebook_variant_urls(page):
+            if direct_url in seen:
+                continue
+            seen.add(direct_url)
+            variants.append((label, direct_url))
+
+    if not variants:
+        return None
+
+    # Prefer HD first, while still exposing SD when Facebook publishes both.
+    variants.sort(key=lambda item: 0 if item[0] == "HD" else 1)
+    formats = []
+    for index, (label, direct_url) in enumerate(variants[:4]):
+        formats.append(
+            {
+                "id": f"fb-{label.lower()}-{index}",
+                "label": label,
+                "height": 0,
+                "width": 0,
+                "fps": 0.0,
+                "tbr": 0.0,
+                "filesize": 0,
+                "ext": "mp4",
+                "url": direct_url,
+                "headers": {
+                    "user-agent": _FACEBOOK_UA,
+                    "referer": pages[0][0],
+                },
+            }
+        )
+    return {"title": title, "formats": formats}
+
 def analyze_media(url: str, platform: str) -> dict[str, Any]:
+    if platform == "Facebook":
+        facebook = _analyze_facebook(url)
+        if facebook and facebook.get("formats"):
+            return facebook
+
     try:
         with yt_dlp.YoutubeDL(_base_opts(platform)) as ydl:
             info = ydl.extract_info(url, download=False)
